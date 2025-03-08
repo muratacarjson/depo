@@ -1,2 +1,6 @@
-aiogram
-apscheduler
+import telegram
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters
+import time
+from datetime import datetime, timedelta
+import sqlite3
+import threading
