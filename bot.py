@@ -1,79 +1,121 @@
-
-import asyncio
-import logging
-import sqlite3
+import telegram
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters
 import time
 from datetime import datetime, timedelta
-from aiogram import Bot, Dispatcher, types
-from aiogram.types import ChatPermissions
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from aiogram.filters import Command
-from aiogram.enums import ChatMemberStatus
+import sqlite3
+import threading
 
-# Telegram Bot API Token
-API_TOKEN = "7818517016:AAGiG3hsYcvB2YG7L5Q0zPOsCsyokE87KYc"
 
-bot = Bot(token=API_TOKEN)
-dp = Dispatcher()
-scheduler = AsyncIOScheduler()
 
-# SQLite Database Connection
-conn = sqlite3.connect("users.db")
-cursor = conn.cursor()
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS users (
-    user_id INTEGER PRIMARY KEY,
-    join_date TEXT
-)
-""")
-conn.commit()
+TOKEN = '7818517016:AAGiG3hsYcvB2YG7L5Q0zPOsCsyokE87KYc'
 
-@dp.chat_member()
-async def on_user_join(event: types.ChatMemberUpdated):
-    if event.new_chat_member.status == ChatMemberStatus.MEMBER:
-        user_id = event.new_chat_member.user.id
-        group_id = event.chat.id
-        join_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        cursor.execute("INSERT OR REPLACE INTO users (user_id, join_date) VALUES (?, ?)", (user_id, join_date))
+# Veritabanı bağlantısı
+def init_db():
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS users 
+                 (user_id INTEGER, chat_id INTEGER, join_date TEXT)''')
+    conn.commit()
+    conn.close()
+
+# Yeni üye katıldığında
+def welcome(update, context):
+    chat_id = update.message.chat_id
+    for new_member in update.message.new_chat_members:
+        user_id = new_member.id
+
+        # Veritabanına kaydet
+        conn = sqlite3.connect('users.db')
+        c = conn.cursor()
+        join_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        c.execute("INSERT INTO users (user_id, chat_id, join_date) VALUES (?, ?, ?)",
+                 (user_id, chat_id, join_date))
         conn.commit()
-        await bot.send_message(group_id, f"👋 {event.new_chat_member.user.full_name} gruba katıldı. Süresi 30 gün sonra dolacak.")
+        conn.close()
 
-async def check_users():
-    cursor.execute("SELECT user_id, join_date FROM users")
-    users = cursor.fetchall()
+        update.message.reply_text(f"Hoş geldin {new_member.full_name}! 30 günün başladı.")
+
+# Kalan süreyi kontrol etme (manuel komut)
+def check_time(update, context):
+    chat_id = update.message.chat_id
+    message = check_and_kick_users(context, chat_id)
+    update.message.reply_text(message)
+
+# Otomatik kontrol fonksiyonu
+def check_and_kick_users(context, chat_id):
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+
+    c.execute("SELECT user_id, join_date FROM users WHERE chat_id = ?", (chat_id,))
+    users = c.fetchall()
+
+    message = "Kullanıcıların kalan süreleri:\n"
+    current_time = datetime.now()
+    users_to_remove = []
+
     for user_id, join_date in users:
-        join_date = datetime.strptime(join_date, "%Y-%m-%d %H:%M:%S")
-        days_left = 30 - (datetime.now() - join_date).days
-        if days_left <= 0:
+        join_datetime = datetime.strptime(join_date, '%Y-%m-%d %H:%M:%S')
+        expiry_date = join_datetime + timedelta(days=30)
+        remaining_time = expiry_date - current_time
+
+        try:
+            member = context.bot.get_chat_member(chat_id, user_id)
+            user_name = member.user.full_name
+        except:
+            user_name = f"User_{user_id}"
+
+        if remaining_time.total_seconds() <= 0:
             try:
-                await bot.ban_chat_member(group_id, user_id)
-                await bot.send_message(group_id, f"🚨 <a href='tg://user?id={user_id}'>Kullanıcı</a> süresi dolduğu için gruptan çıkarıldı.", parse_mode="HTML")
-                cursor.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
-                conn.commit()
-            except Exception as e:
-                logging.error(f"Kullanıcıyı atarken hata oluştu: {e}")
+                context.bot.kick_chat_member(chat_id, user_id)
+                users_to_remove.append((user_id, chat_id))
+                message += f"{user_name} - Süresi doldu ve gruptan atıldı\n"
+            except:
+                message += f"{user_name} - Atılamadı (yetki hatası)\n"
+        else:
+            days_left = remaining_time.days
+            hours_left = remaining_time.seconds // 3600
+            message += f"{user_name} - {days_left} gün {hours_left} saat kaldı\n"
 
-@dp.message(Command("kalan_sure"))
-async def show_remaining_time(message: types.Message):
-    admin_id = message.from_user.id
-    group_id = message.chat.id
-    cursor.execute("SELECT user_id, join_date FROM users")
-    users = cursor.fetchall()
-    response = "📌 Kullanıcıların kalan süreleri:\n"
-    for user_id, join_date in users:
-        join_date = datetime.strptime(join_date, "%Y-%m-%d %H:%M:%S")
-        days_left = 30 - (datetime.now() - join_date).days
-        response += f"<a href='tg://user?id={user_id}'>Kullanıcı</a>: {days_left} gün kaldı\n"
-    await bot.send_message(admin_id, response, parse_mode="HTML")
+    # Süresi dolanları veritabanından sil
+    for user_id, chat_id in users_to_remove:
+        c.execute("DELETE FROM users WHERE user_id = ? AND chat_id = ?", (user_id, chat_id))
 
-async def on_startup():
-    scheduler.add_job(check_users, "interval", hours=1)
-    scheduler.start()
+    conn.commit()
+    conn.close()
+    return message
 
-async def main():
-    logging.basicConfig(level=logging.INFO)
-    await on_startup()
-    await dp.start_polling(bot)
+# Otomatik kontrol döngüsü
+def auto_check(context):
+    while True:
+        conn = sqlite3.connect('users.db')
+        c = conn.cursor()
+        c.execute("SELECT DISTINCT chat_id FROM users")
+        chat_ids = c.fetchall()
+        conn.close()
 
-if __name__ == "__main__":
-    asyncio.run(main())
+        for (chat_id,) in chat_ids:
+            check_and_kick_users(context, chat_id)
+
+        # Her 1 saatte bir kontrol et (3600 saniye)
+        time.sleep(3600)
+
+# Botu başlat
+def main():
+    init_db()
+    updater = Updater(TOKEN, use_context=True)
+    dp = updater.dispatcher
+
+    # Handler'ları ekle
+    dp.add_handler(MessageHandler(Filters.status_update.new_chat_members, welcome))
+    dp.add_handler(CommandHandler("zaman", check_time))
+
+    # Otomatik kontrolü ayrı bir thread'de başlat
+    context = updater.job_queue
+    threading.Thread(target=auto_check, args=(context,), daemon=True).start()
+
+    # Botu çalıştır
+    updater.start_polling()
+    updater.idle()
+
+if __name__ == '__main__':
+    main()
